@@ -10,16 +10,25 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime
 import time
+import sys
 
 # ==================== CONFIG ====================
-API_ID = int(os.environ.get("API_ID", "YOUR_API_ID"))
-API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "YOUR_ADMIN_ID").split(",")]
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = [int(id) for id in os.environ.get("ADMIN_IDS", "0").split(",")]
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
+# Check if config is set
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    print("❌ Error: API_ID, API_HASH, and BOT_TOKEN must be set!")
+    sys.exit(1)
+
 # Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Bot Client
@@ -27,7 +36,8 @@ app = Client(
     "pixeldrain_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    workers=20
 )
 
 # Database
@@ -51,108 +61,83 @@ def extract_file_id(url):
     return None
 
 async def get_direct_link(file_id):
-    """Extract direct download link from Pixeldrain page"""
+    """Extract direct download link from Pixeldrain"""
     try:
-        # Method 1: Try API first
-        api_url = f"https://pixeldrain.com/api/file/{file_id}"
+        # Try multiple methods
+        methods = [
+            f"https://pixeldrain.com/api/file/{file_id}",  # API
+            f"https://pixeldrain.com/d/{file_id}"  # Webpage
+        ]
         
         async with aiohttp.ClientSession() as session:
-            # Try API
-            async with session.head(api_url, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    return api_url, None
+            # Method 1: Try API
+            try:
+                async with session.head(methods[0], allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        # Get file info from API
+                        async with session.get(f"https://pixeldrain.com/api/file/{file_id}/info") as info_resp:
+                            if info_resp.status == 200:
+                                info = await info_resp.json()
+                                return methods[0], {
+                                    'name': info.get('name', f'pixeldrain_{file_id}'),
+                                    'size': info.get('size', 0),
+                                    'mime': info.get('mime_type', 'application/octet-stream')
+                                }
+            except:
+                pass
             
             # Method 2: Scrape webpage
-            page_url = f"https://pixeldrain.com/d/{file_id}"
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
-            async with session.get(page_url, headers=headers) as resp:
+            async with session.get(methods[1], headers=headers) as resp:
                 if resp.status == 200:
                     html = await resp.text()
-                    soup = BeautifulSoup(html, 'html.parser')
                     
-                    # Try to find file info in meta tags
-                    title_tag = soup.find('title')
-                    if title_tag:
-                        title = title_tag.text.strip()
-                    else:
-                        title = f"pixeldrain_{file_id}"
-                    
-                    # Try to find download link in page source
-                    download_patterns = [
-                        r'href="(https?://[^"]*?pixeldrain[^"]*?download[^"]*?)"',
-                        r'data-url="(https?://[^"]*?)"',
-                        r'url:\s*"([^"]*?)"',
+                    # Try to find download URL in the page
+                    patterns = [
+                        r'<a[^>]*href="([^"]*pixeldrain[^"]*download[^"]*)"',
                         r'downloadUrl["\']\s*:\s*["\']([^"\']+)',
-                        r'file["\']]\s*:\s*["\']([^"\']+)',
+                        r'window\.location\s*=\s*["\']([^"\']+)',
+                        r'<meta[^>]*url=([^"\s]+)',
                     ]
                     
-                    direct_url = None
-                    for pattern in download_patterns:
-                        match = re.search(pattern, html)
+                    download_url = None
+                    for pattern in patterns:
+                        match = re.search(pattern, html, re.IGNORECASE)
                         if match:
-                            direct_url = match.group(1)
-                            if not direct_url.startswith('http'):
-                                direct_url = 'https://pixeldrain.com' + direct_url
+                            download_url = match.group(1)
+                            if not download_url.startswith('http'):
+                                download_url = 'https://pixeldrain.com' + download_url
                             break
                     
-                    # If no direct URL found, use API as fallback
-                    if not direct_url:
-                        direct_url = api_url
+                    if not download_url:
+                        download_url = f"https://pixeldrain.com/api/file/{file_id}"
                     
-                    # Get file size from content-length or meta
-                    file_size = 0
+                    # Extract filename from title
+                    title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
+                    filename = title_match.group(1) if title_match else f"pixeldrain_{file_id}.mp4"
                     
-                    # Try to get size from meta
-                    size_patterns = [
-                        r'Size["\']:?\s*["\']([\d.]+)\s*(GB|MB|KB)',
-                        r'data-size["\']\s*=\s*["\'](\d+)',
-                        r'"size":\s*(\d+)',
-                    ]
+                    # Clean filename
+                    filename = re.sub(r'[^\w\-_\. ]', '', filename)
                     
-                    for pattern in size_patterns:
-                        size_match = re.search(pattern, html, re.IGNORECASE)
-                        if size_match:
-                            try:
-                                if pattern == size_patterns[0]:  # Human readable
-                                    size_val = float(size_match.group(1))
-                                    size_unit = size_match.group(2).upper()
-                                    if size_unit == 'GB':
-                                        file_size = int(size_val * 1024 * 1024 * 1024)
-                                    elif size_unit == 'MB':
-                                        file_size = int(size_val * 1024 * 1024)
-                                    elif size_unit == 'KB':
-                                        file_size = int(size_val * 1024)
-                                else:
-                                    file_size = int(size_match.group(1))
-                                break
-                            except:
-                                pass
-                    
-                    # Try head request to get content-length
-                    try:
-                        async with session.head(direct_url, allow_redirects=True) as head_resp:
-                            if 'content-length' in head_resp.headers:
-                                file_size = int(head_resp.headers['content-length'])
-                    except:
-                        pass
-                    
-                    # Determine mime type from title
-                    mime = 'video/mp4' if '.mp4' in title.lower() else 'application/octet-stream'
-                    
-                    return direct_url, {
-                        'name': title,
-                        'size': file_size,
-                        'mime': mime
+                    return download_url, {
+                        'name': filename,
+                        'size': 0,  # Size will be detected during download
+                        'mime': 'video/mp4' if '.mp4' in filename.lower() else 'application/octet-stream'
                     }
     
     except Exception as e:
         logger.error(f"Error getting direct link: {e}")
         return None, None
     
-    return None, None
+    # Fallback to direct API
+    return f"https://pixeldrain.com/api/file/{file_id}", {
+        'name': f"pixeldrain_{file_id}.mp4",
+        'size': 0,
+        'mime': 'video/mp4'
+    }
 
 def human_readable_size(size):
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -160,44 +145,6 @@ def human_readable_size(size):
             return f"{size:.2f} {unit}"
         size /= 1024.0
     return f"{size:.2f} TB"
-
-async def download_with_progress(url, file_path, status_msg, file_size=0):
-    """Download file with progress"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    total = int(resp.headers.get('content-length', file_size)) or 1
-                    downloaded = 0
-                    start_time = time.time()
-                    
-                    async with aiofiles.open(file_path, 'wb') as f:
-                        async for chunk in resp.content.iter_chunked(1024 * 1024):  # 1MB chunks
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Update progress every 2 seconds
-                            if time.time() - start_time > 2:
-                                percent = (downloaded / total) * 100
-                                speed = downloaded / (time.time() - start_time)
-                                eta = (total - downloaded) / speed if speed > 0 else 0
-                                
-                                progress_text = (
-                                    f"📥 **Downloading...**\n\n"
-                                    f"**Progress:** {percent:.1f}%\n"
-                                    f"**Done:** {human_readable_size(downloaded)} / {human_readable_size(total)}\n"
-                                    f"**Speed:** {human_readable_size(speed)}/s\n"
-                                    f"**ETA:** {eta:.0f}s"
-                                )
-                                await status_msg.edit_text(progress_text)
-                                start_time = time.time()
-                    
-                    return True, downloaded
-                else:
-                    return False, 0
-    except Exception as e:
-        logger.error(f"Download error: {e}")
-        return False, 0
 
 @app.on_message(filters.command(["start"]))
 async def start_command(client, message):
@@ -209,11 +156,14 @@ async def start_command(client, message):
         "• I'll download and send the file\n"
         "• Up to 2GB files supported\n\n"
         "**Example:**\n"
-        "`https://pixeldrain.com/d/ZDSmxd52`"
+        "`https://pixeldrain.com/d/ZDSmxd52`\n\n"
+        "**Supported links:**\n"
+        "• pixeldrain.com/d/ID\n"
+        "• pixeldrain.com/u/ID\n"
+        "• pixeldrain.com/l/ID"
     )
     await message.reply_text(welcome)
     
-    # Store user
     user_id = message.from_user.id
     if user_id not in user_data:
         user_data[user_id] = {'joined': datetime.now()}
@@ -228,10 +178,28 @@ async def stats_command(client, message):
         f"**Active Downloads:** {active_downloads}"
     )
 
+@app.on_message(filters.command(["users"]) & filters.user(ADMIN_IDS))
+async def users_command(client, message):
+    if not user_data:
+        await message.reply_text("No users found.")
+        return
+    
+    users_list = "**📋 Users List:**\n\n"
+    for uid, data in list(user_data.items())[:50]:
+        joined = data.get('joined', datetime.now()).strftime("%Y-%m-%d")
+        users_list += f"• `{uid}` - {joined}\n"
+    
+    users_list += f"\n**Total: {len(user_data)} users**"
+    await message.reply_text(users_list)
+
 @app.on_message(filters.text)
 async def handle_message(client, message):
     user_id = message.from_user.id
     text = message.text.strip()
+    
+    # Store user
+    if user_id not in user_data:
+        user_data[user_id] = {'joined': datetime.now()}
     
     # Check for Pixeldrain link
     if "pixeldrain.com" in text:
@@ -241,7 +209,6 @@ async def handle_message(client, message):
             await message.reply_text("❌ **Invalid Pixeldrain link!**")
             return
         
-        # Check if already downloading
         if file_id in downloading:
             await message.reply_text("⏳ **This file is already being downloaded. Please wait...**")
             return
@@ -258,74 +225,75 @@ async def handle_message(client, message):
                 downloading.discard(file_id)
                 return
             
-            # Get file info
-            file_name = file_info.get('name', f"pixeldrain_{file_id}") if file_info else f"pixeldrain_{file_id}"
-            file_size = file_info.get('size', 0) if file_info else 0
+            file_name = file_info.get('name', f"pixeldrain_{file_id}.mp4")
             
-            # Check size limits
-            if file_size > MAX_FILE_SIZE and not is_admin(user_id):
-                await status_msg.edit_text(
-                    f"❌ **File too large!**\n\n"
-                    f"Size: {human_readable_size(file_size)}\n"
-                    f"Max: 2GB"
-                )
-                downloading.discard(file_id)
-                return
-            
-            # Group limit
-            if message.chat.type != enums.ChatType.PRIVATE and not is_admin(user_id):
-                if file_size > 50 * 1024 * 1024:  # 50MB
-                    await status_msg.edit_text(
-                        f"❌ **In groups, non-admins can only download files up to 50MB!**\n\n"
-                        f"Size: {human_readable_size(file_size)}"
-                    )
-                    downloading.discard(file_id)
-                    return
-            
-            await status_msg.edit_text(
-                f"**📥 Downloading...**\n\n"
-                f"**File:** `{file_name}`\n"
-                f"**Size:** {human_readable_size(file_size)}"
-            )
+            await status_msg.edit_text(f"📥 **Downloading:** `{file_name}`")
             
             # Download file
             os.makedirs("downloads", exist_ok=True)
-            temp_file = f"downloads/{file_id}_{int(time.time())}.tmp"
+            temp_file = f"downloads/{file_id}_{int(time.time())}.mp4"
             
-            success, downloaded_size = await download_with_progress(direct_url, temp_file, status_msg, file_size)
-            
-            if success and downloaded_size > 0:
-                await status_msg.edit_text("✅ **Download complete! Uploading to Telegram...**")
-                
-                # Upload to Telegram
-                try:
-                    if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
-                        await client.send_video(
-                            chat_id=message.chat.id,
-                            video=temp_file,
-                            caption=f"**{file_name}**\n\nDownloaded by @{client.me.username}",
-                            supports_streaming=True,
-                            duration=0  # Auto-detect
-                        )
+            # Download with progress
+            async with aiohttp.ClientSession() as session:
+                async with session.get(direct_url, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        total = int(resp.headers.get('content-length', 0))
+                        downloaded = 0
+                        start_time = time.time()
+                        
+                        async with aiofiles.open(temp_file, 'wb') as f:
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                await f.write(chunk)
+                                downloaded += len(chunk)
+                                
+                                # Update progress
+                                if total > 0 and time.time() - start_time > 2:
+                                    percent = (downloaded / total) * 100
+                                    await status_msg.edit_text(f"📥 **Downloading:** {percent:.1f}%")
+                                    start_time = time.time()
+                        
+                        # Check if download was successful
+                        if downloaded > 0:
+                            await status_msg.edit_text("✅ **Download complete! Uploading to Telegram...**")
+                            
+                            # Upload to Telegram
+                            try:
+                                # Check file size limit
+                                if downloaded > MAX_FILE_SIZE and not is_admin(user_id):
+                                    await status_msg.edit_text("❌ **File too large! Max 2GB**")
+                                    os.remove(temp_file)
+                                    downloading.discard(file_id)
+                                    return
+                                
+                                # Send based on file type
+                                if file_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                                    await client.send_video(
+                                        chat_id=message.chat.id,
+                                        video=temp_file,
+                                        caption=f"**{file_name}**\n\nDownloaded by @{client.me.username}",
+                                        supports_streaming=True
+                                    )
+                                else:
+                                    await client.send_document(
+                                        chat_id=message.chat.id,
+                                        document=temp_file,
+                                        caption=f"**{file_name}**"
+                                    )
+                                
+                                await status_msg.delete()
+                                
+                            except Exception as e:
+                                await status_msg.edit_text(f"❌ **Upload failed:** {str(e)}")
+                            
+                            # Cleanup
+                            try:
+                                os.remove(temp_file)
+                            except:
+                                pass
+                        else:
+                            await status_msg.edit_text("❌ **Download failed!**")
                     else:
-                        await client.send_document(
-                            chat_id=message.chat.id,
-                            document=temp_file,
-                            caption=f"**{file_name}**"
-                        )
-                    
-                    await status_msg.delete()
-                    
-                except Exception as e:
-                    await status_msg.edit_text(f"❌ **Upload failed:** {str(e)}")
-                
-                # Cleanup
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            else:
-                await status_msg.edit_text("❌ **Download failed! Please try again later.**")
+                        await status_msg.edit_text(f"❌ **Download failed! Status code: {resp.status}**")
         
         except Exception as e:
             await status_msg.edit_text(f"❌ **Error:** {str(e)}")
@@ -334,11 +302,13 @@ async def handle_message(client, message):
         finally:
             downloading.discard(file_id)
     
-    # Ignore non-Pixeldrain messages
-    else:
-        if message.chat.type == enums.ChatType.PRIVATE:
-            await message.reply_text("Please send a Pixeldrain link only!")
+    elif message.chat.type == enums.ChatType.PRIVATE:
+        await message.reply_text("Please send a valid Pixeldrain link!")
 
-print("🚀 Bot Started!")
-print(f"👤 Admins: {ADMIN_IDS}")
-app.run()
+if __name__ == "__main__":
+    print("=" * 50)
+    print("🚀 Pixeldrain Downloader Bot Starting...")
+    print(f"👤 Admin IDs: {ADMIN_IDS}")
+    print(f"📊 Max File Size: 2GB")
+    print("=" * 50)
+    app.run()
