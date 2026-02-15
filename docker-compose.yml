@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: telegram_video_bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - ADMIN_ID=${ADMIN_ID}
+      - CACHE_CHANNEL_ID=${CACHE_CHANNEL_ID}
+    volumes:
+      - ./downloads:/tmp/downloads
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
