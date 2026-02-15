@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install ffmpeg and other deps
+# Install ffmpeg
 RUN apt-get update && \
-    apt-get install -y ffmpeg aria2 && \
+    apt-get install -y ffmpeg && \
     apt-get clean
 
 COPY requirements.txt .
