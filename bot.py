@@ -446,6 +446,12 @@ async def cleanup_old_files():
             logger.error(f"Error in cleanup task: {e}")
 
 
+async def post_init(application: Application):
+    """Start background tasks after bot initialization"""
+    # Start cleanup task in background
+    asyncio.create_task(cleanup_old_files())
+
+
 def main():
     """Start the bot"""
     if not BOT_TOKEN:
@@ -453,7 +459,7 @@ def main():
         return
     
     # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -461,13 +467,6 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(clear_cache, pattern="^clear_cache$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    
-    # Start cleanup task
-    application.job_queue.run_repeating(
-        lambda context: asyncio.create_task(cleanup_old_files()),
-        interval=300,
-        first=10
-    )
     
     logger.info("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
