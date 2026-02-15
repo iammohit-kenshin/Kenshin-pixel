@@ -1,106 +1,147 @@
 import os
-import re
-import time
-import requests
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from yt_dlp import YoutubeDL
 
-# --- RAILWAY VARIABLES ---
-# Code ab direct Railway ke 'Variables' tab se data uthayega
-API_ID = int(os.environ.get("API_ID")) 
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+import config
+import cache
 
 app = Client(
-    "PixeldrainPremium", 
-    api_id=API_ID, 
-    api_hash=API_HASH, 
-    bot_token=BOT_TOKEN
+    "video_bot",
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    bot_token=config.BOT_TOKEN
 )
 
-# Regex to find Pixeldrain ID
-PD_PATTERN = r"(?:https?://)?pixeldrain\.com/[du]/([a-zA-Z0-9]+)"
+# ========= START COMMAND =========
 
-# --- PROGRESS BAR HELPER ---
-async def progress_func(current, total, message, ud_type, start_time):
-    now = time.time()
-    diff = now - start_time
-    # Har 5 second mein update karega taaki Telegram flood na ho
-    if round(diff % 5.00) == 0 or current == total:
-        percentage = current * 100 / total
-        speed = current / diff if diff > 0 else 0
-        
-        progress_str = "[{0}{1}] {2}%".format(
-            ''.join(["▰" for i in range(int(percentage / 10))]),
-            ''.join(["▱" for i in range(10 - int(percentage / 10))]),
-            round(percentage, 2)
-        )
-        
-        tmp = f"⚡ **{ud_type}**\n\n" \
-              f"{progress_str}\n\n" \
-              f"🚀 **Speed:** {round(speed / (1024 * 1024), 2)} MB/s\n" \
-              f"📦 **Status:** {round(current / (1024 * 1024), 2)}MB / {round(total / (1024 * 1024), 2)}MB"
-        
-        try:
-            await message.edit_text(tmp)
-        except:
-            pass
+@app.on_message(filters.private & filters.command("start"))
+async def start(_, msg):
+    await msg.reply_text("Send me a video link 🎬")
 
-@app.on_message(filters.regex(PD_PATTERN))
-async def pixeldrain_handler(client, message):
-    url = message.text
-    file_id = re.search(PD_PATTERN, url).group(1)
-    status_msg = await message.reply_text("🔎 **Link Analyze ho raha hai...**")
-    
-    # 1. API se info fetch karna
-    info_url = f"https://pixeldrain.com/api/file/{file_id}/info"
-    try:
-        res = requests.get(info_url).json()
-        if not res.get("success"):
-            return await status_msg.edit("❌ **Invalid Link!** File ya toh delete ho gayi hai ya link galat hai.")
-        
-        file_name = res.get("name")
-        file_size = res.get("size")
-        direct_link = f"https://pixeldrain.com/api/file/{file_id}?download"
+# ========= HANDLE LINK =========
 
-        # 2. Server par download start
-        await status_msg.edit(f"📥 **Downloading to Server...**\n`{file_name}`")
-        
-        start_time = time.time()
-        r = requests.get(direct_link, stream=True)
-        with open(file_name, 'wb') as f:
-            downloaded = 0
-            for chunk in r.iter_content(chunk_size=1024*1024): # 1MB chunks
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    # Progress update
-                    await progress_func(downloaded, file_size, status_msg, "Downloading...", start_time)
+@app.on_message(filters.private & filters.text)
+async def handle_link(client, message):
+    url = message.text.strip()
 
-        # 3. Telegram par Upload
-        await status_msg.edit("📤 **Telegram par bhej raha hoon...**")
-        start_time_up = time.time()
-        
-        await client.send_video(
-            chat_id=message.chat.id,
-            video=file_name,
-            caption=f"✅ **File:** `{file_name}`\n💰 **Size:** {round(file_size/(1024*1024), 2)} MB\n\n🔥 **Bot by Kenshin**",
-            progress=progress_func,
-            progress_args=(status_msg, "Uploading...", start_time_up),
-            supports_streaming=True
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Video", callback_data=f"video|{url}")],
+        [InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"audio|{url}")]
+    ])
+
+    await message.reply_text("Choose format:", reply_markup=buttons)
+
+# ========= CALLBACK HANDLER =========
+
+@app.on_callback_query()
+async def callback_handler(client, callback):
+    data = callback.data.split("|")
+    mode = data[0]
+    url = data[1]
+
+    await callback.message.edit_text("🔍 Fetching available qualities...")
+
+    ydl_opts = {'quiet': True}
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if mode == "video":
+        qualities = []
+        for f in info["formats"]:
+            if f.get("height") and f.get("ext") == "mp4":
+                qualities.append((f["format_id"], f["height"]))
+
+        # Remove duplicates
+        qualities = list({q[1]: q for q in qualities}.values())
+        qualities = sorted(qualities, key=lambda x: x[1], reverse=True)
+
+        buttons = []
+        for q in qualities[:6]:  # show top 6
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{q[1]}p",
+                    callback_data=f"download|video|{q[0]}|{url}"
+                )
+            ])
+
+        await callback.message.edit_text(
+            "Select quality:",
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-    except Exception as e:
-        await message.reply_text(f"💀 **Error Aa Gaya!**\n`{str(e)}`")
-    
-    finally:
-        # Cleanup: File delete karna zaroori hai Railway ka space bachane ke liye
-        if os.path.exists(file_name):
-            os.remove(file_name)
-        try:
-            await status_msg.delete()
-        except:
-            pass
+    elif mode == "audio":
+        await download_and_send(callback, url, "audio", "mp3", None)
 
-print("Bahi Bot Ready Hai! Railway Variables se connected...")
+# ========= DOWNLOAD FUNCTION =========
+
+async def download_and_send(callback, url, mode, format_id, quality_id):
+
+    cached = cache.get_cached(url, format_id)
+    if cached:
+        await callback.message.edit_text("⚡ Sending from cache...")
+        await app.copy_message(
+            callback.message.chat.id,
+            config.LOG_GROUP_ID,
+            cached
+        )
+        return
+
+    await callback.message.edit_text("⬇ Downloading...")
+
+    output = "downloads/%(title)s.%(ext)s"
+
+    if mode == "video":
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': output,
+            'merge_output_format': 'mp4'
+        }
+    else:
+        ydl_opts = {
+            'format': 'bestaudio',
+            'outtmpl': output,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        file_path = ydl.prepare_filename(info)
+        if mode == "audio":
+            file_path = file_path.rsplit(".", 1)[0] + ".mp3"
+
+    await callback.message.edit_text("⬆ Uploading...")
+
+    sent = await app.send_document(
+        config.LOG_GROUP_ID,
+        file_path,
+        thumb=info.get("thumbnail"),
+        caption=info.get("title")
+    )
+
+    file_id = sent.document.file_id
+    cache.save_cache(url, format_id, sent.id)
+
+    await app.copy_message(
+        callback.message.chat.id,
+        config.LOG_GROUP_ID,
+        sent.id
+    )
+
+    os.remove(file_path)
+
+# ========= DOWNLOAD QUALITY HANDLER =========
+
+@app.on_callback_query(filters.regex("^download"))
+async def quality_download(client, callback):
+    _, mode, format_id, url = callback.data.split("|")
+    await download_and_send(callback, url, mode, format_id, format_id)
+
+# ========= RUN =========
+
 app.run()
