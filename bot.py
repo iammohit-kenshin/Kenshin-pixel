@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -14,17 +15,26 @@ app = Client(
     bot_token=config.BOT_TOKEN
 )
 
-# ========= START COMMAND =========
+# ✅ URL validation
+def is_valid_url(text):
+    url_pattern = re.compile(r'https?://\S+')
+    return re.match(url_pattern, text)
 
-@app.on_message(filters.private & filters.command("start"))
+# ================= START =================
+
+@app.on_message(filters.command("start") & filters.private)
 async def start(_, msg):
-    await msg.reply_text("Send me a video link 🎬")
+    await msg.reply_text("Send me a valid video link 🎬")
 
-# ========= HANDLE LINK =========
+# ================= HANDLE LINK =================
 
 @app.on_message(filters.private & filters.text)
 async def handle_link(client, message):
+
     url = message.text.strip()
+
+    if not is_valid_url(url):
+        return  # ignore normal text
 
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎬 Video", callback_data=f"video|{url}")],
@@ -33,36 +43,40 @@ async def handle_link(client, message):
 
     await message.reply_text("Choose format:", reply_markup=buttons)
 
-# ========= CALLBACK HANDLER =========
+# ================= CALLBACK =================
 
 @app.on_callback_query()
 async def callback_handler(client, callback):
+
     data = callback.data.split("|")
     mode = data[0]
     url = data[1]
 
-    await callback.message.edit_text("🔍 Fetching available qualities...")
-
-    ydl_opts = {'quiet': True}
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    await callback.answer()
 
     if mode == "video":
-        qualities = []
+
+        await callback.message.edit_text("🔍 Fetching qualities...")
+
+        ydl_opts = {'quiet': True}
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        formats = []
         for f in info["formats"]:
             if f.get("height") and f.get("ext") == "mp4":
-                qualities.append((f["format_id"], f["height"]))
+                formats.append((f["format_id"], f["height"]))
 
-        # Remove duplicates
-        qualities = list({q[1]: q for q in qualities}.values())
-        qualities = sorted(qualities, key=lambda x: x[1], reverse=True)
+        # remove duplicates
+        formats = list({f[1]: f for f in formats}.values())
+        formats = sorted(formats, key=lambda x: x[1], reverse=True)
 
         buttons = []
-        for q in qualities[:6]:  # show top 6
+        for f in formats[:5]:
             buttons.append([
                 InlineKeyboardButton(
-                    f"{q[1]}p",
-                    callback_data=f"download|video|{q[0]}|{url}"
+                    f"{f[1]}p",
+                    callback_data=f"download|{f[0]}|{url}"
                 )
             ])
 
@@ -72,47 +86,37 @@ async def callback_handler(client, callback):
         )
 
     elif mode == "audio":
-        await download_and_send(callback, url, "audio", "mp3", None)
 
-# ========= DOWNLOAD FUNCTION =========
+        await download_and_send(callback, url, audio=True)
 
-async def download_and_send(callback, url, mode, format_id, quality_id):
+# ================= DOWNLOAD =================
 
-    cached = cache.get_cached(url, format_id)
-    if cached:
-        await callback.message.edit_text("⚡ Sending from cache...")
-        await app.copy_message(
-            callback.message.chat.id,
-            config.LOG_GROUP_ID,
-            cached
-        )
-        return
+async def download_and_send(callback, url, format_id=None, audio=False):
 
     await callback.message.edit_text("⬇ Downloading...")
 
-    output = "downloads/%(title)s.%(ext)s"
-
-    if mode == "video":
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': output,
-            'merge_output_format': 'mp4'
-        }
-    else:
+    if audio:
         ydl_opts = {
             'format': 'bestaudio',
-            'outtmpl': output,
+            'outtmpl': 'downloads/%(title)s.%(ext)s',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }]
         }
+    else:
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': 'downloads/%(title)s.%(ext)s',
+            'merge_output_format': 'mp4'
+        }
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         file_path = ydl.prepare_filename(info)
-        if mode == "audio":
+
+        if audio:
             file_path = file_path.rsplit(".", 1)[0] + ".mp3"
 
     await callback.message.edit_text("⬆ Uploading...")
@@ -120,12 +124,8 @@ async def download_and_send(callback, url, mode, format_id, quality_id):
     sent = await app.send_document(
         config.LOG_GROUP_ID,
         file_path,
-        thumb=info.get("thumbnail"),
         caption=info.get("title")
     )
-
-    file_id = sent.document.file_id
-    cache.save_cache(url, format_id, sent.id)
 
     await app.copy_message(
         callback.message.chat.id,
@@ -135,13 +135,13 @@ async def download_and_send(callback, url, mode, format_id, quality_id):
 
     os.remove(file_path)
 
-# ========= DOWNLOAD QUALITY HANDLER =========
+# ================= QUALITY DOWNLOAD =================
 
 @app.on_callback_query(filters.regex("^download"))
 async def quality_download(client, callback):
-    _, mode, format_id, url = callback.data.split("|")
-    await download_and_send(callback, url, mode, format_id, format_id)
+    _, format_id, url = callback.data.split("|")
+    await download_and_send(callback, url, format_id=format_id)
 
-# ========= RUN =========
+# ================= RUN =================
 
 app.run()
